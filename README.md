@@ -11,22 +11,56 @@ A native macOS desktop application for monitoring system sensors and controlling
 
 ## Features & Screenshots
 
-**Dashboard** — Real-time overview of CPU/GPU temperatures, fan speeds, and power consumption
+- **Dashboard** — Real-time overview of CPU/GPU temperatures, fan speeds, and power consumption
+- **Stats Modules** — Dedicated CPU, GPU, Memory, Disk, Network, and Battery pages with live charts and top processes
+- **Fan Control** — Manual fan speed control with slider and quick presets (0%, 25%, 50%, 75%, 100%)
+- **Fan Curve Editor** — Visual drag-and-drop curve editor mapping temperature → fan speed with interpolation
+- **Profiles** — Built-in presets (Silent, Default, Balanced, Performance, Max) and custom profile save/load
+- **Sensor Monitoring** — Read all available SMC sensors: temperatures, voltages, currents, and power
+- **Menu Bar** — Quick access to temperatures, fan speeds, and mode switching from the menu bar
+
+### Dashboard
 ![Dashboard](images/dashboard.png)
 
-**Fan Control** — Manual fan speed control with slider and quick presets (0%, 25%, 50%, 75%, 100%)
+### CPU Insights
+Precise P/E-core usage breakdown, per-core bars, usage history with selectable range, load averages, clock frequencies, and top CPU processes.
+![CPU](images/cpu.png)
+
+### GPU Insights
+GPU utilization gauge, render/tiler split, usage history, and live stats for the current graphics device.
+![GPU](images/gpu.png)
+
+### Memory
+Live memory pressure, breakdown of app/wired/compressed/swap usage, trend charts, and top memory-hungry processes.
+![Memory](images/memory.png)
+
+### Network
+Download/upload gauges, selectable traffic history, interface details, IP addresses, DNS servers, and public IP lookup.
+![Network](images/network.png)
+
+### Disk
+Volume usage gauges, I/O throughput, and top processes hitting the disk.
+![Disk](images/disk.png)
+
+### Battery
+Health, cycle count, adapter info, power draw, and charging status.
+![Battery](images/battery.png)
+
+### Fan Control
+Manual overrides with instant presets and dual-fan feedback.
 ![Fan Control](images/fancontrol.png)
 
-**Fan Curve Editor** — Visual drag-and-drop curve editor mapping temperature → fan speed with interpolation
+### Fan Curve Editor
+Visual drag-and-drop curve editor mapping temperature → fan speed with interpolation.
 ![Fan Curve](images/fancurve.png)
 
-**Profiles** — Built-in presets (Silent, Default, Balanced, Performance, Max) and custom profile save/load
+### Profiles
+Built-in presets (Silent, Default, Balanced, Performance, Max) and custom profile save/load.
 ![Profiles](images/profiles.png)
 
-**Sensor Monitoring** — Read all available SMC sensors: temperatures, voltages, currents, and power
+### Sensor Monitoring
+Read all available SMC sensors: temperatures, voltages, currents, and power.
 ![Sensors](images/sensors.png)
-
-**Menu Bar** — Quick access to temperatures, fan speeds, and mode switching from the menu bar
 
 ## Requirements
 

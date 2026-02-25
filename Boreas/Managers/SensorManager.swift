@@ -51,7 +51,7 @@ class SensorManager: ObservableObject {
     @Published var isDiscovering = true
     @Published var temperatureHistory: [TemperatureSnapshot] = []
     @Published var historyRange: HistoryRange = .max {
-        didSet { updateFilteredHistory() }
+        didSet { scheduleFilteredHistoryUpdate() }
     }
     @Published private(set) var filteredHistory: [TemperatureSnapshot] = []
 
@@ -60,7 +60,7 @@ class SensorManager: ObservableObject {
     private var discoveredSensors: [(key: String, name: String, category: SensorCategory)] = []
     private let discoveryQueue = DispatchQueue(label: "com.boreas.sensor-discovery", qos: .userInitiated)
     private let readQueue = DispatchQueue(label: "com.boreas.sensor-read", qos: .utility)
-    private let maxHistoryPoints = 600
+    private let maxHistoryPoints = 86400
 
     init() {
         discoverSensors()
@@ -139,7 +139,7 @@ class SensorManager: ObservableObject {
         guard !isMonitoring else { return }
         isMonitoring = true
 
-        timer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.updateReadings()
         }
         RunLoop.main.add(timer!, forMode: .common)
@@ -189,7 +189,7 @@ class SensorManager: ObservableObject {
 
             // Calculate aggregates on background thread
             let cpuTemps = tempReadings.filter {
-                $0.key.hasPrefix("TC") || $0.key.hasPrefix("Tc") || $0.key.hasPrefix("Tp")
+                $0.key.hasPrefix("TC") || $0.key.hasPrefix("Tc")
             }
             let gpuTemps = tempReadings.filter {
                 $0.key.hasPrefix("TG") || $0.key.hasPrefix("Tg")
@@ -227,7 +227,7 @@ class SensorManager: ObservableObject {
 
     private func cpuTemps() -> [SensorReading] {
         temperatureReadings.filter {
-            $0.key.hasPrefix("TC") || $0.key.hasPrefix("Tc") || $0.key.hasPrefix("Tp")
+            $0.key.hasPrefix("TC") || $0.key.hasPrefix("Tc")
         }
     }
 
@@ -261,6 +261,12 @@ class SensorManager: ObservableObject {
     var gpuCoreCount: Int { gpuTemps().count }
 
     // MARK: - History helpers
+
+    private func scheduleFilteredHistoryUpdate() {
+        DispatchQueue.main.async { [weak self] in
+            self?.updateFilteredHistory()
+        }
+    }
 
     func updateFilteredHistory() {
         let window = historyRange.window

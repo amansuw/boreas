@@ -10,6 +10,12 @@ struct BoreasApp: App {
                 .environmentObject(appDelegate.sensorManager)
                 .environmentObject(appDelegate.fanManager)
                 .environmentObject(appDelegate.profileManager)
+                .environmentObject(appDelegate.cpuManager)
+                .environmentObject(appDelegate.ramManager)
+                .environmentObject(appDelegate.gpuManager)
+                .environmentObject(appDelegate.batteryManager)
+                .environmentObject(appDelegate.networkManager)
+                .environmentObject(appDelegate.diskManager)
                 .frame(minWidth: 900, minHeight: 650)
         }
         .windowStyle(.titleBar)
@@ -24,6 +30,29 @@ struct BoreasApp: App {
 
 struct StatusBarIconView: View {
     @ObservedObject var fanManager: FanManager
+
+    // private var iconSpeed: Speed {
+    //     // White: curve cooldown (takes absolute priority)
+    //     if fanManager.isCurveCooldownActive { return .1 }
+    //     // Also show white while yielding control/unlocking
+    //     if fanManager.isYielding { return .1 }
+
+    //     let pct = max(0, fanManager.averageSpeedPercentage)
+    //     switch pct {
+    //     case 0:
+    //         return .gray    // idle
+    //     case ..<20:
+    //         return .blue
+    //     case ..<40:
+    //         return .green
+    //     case ..<60:
+    //         return .yellow
+    //     case ..<80:
+    //         return .orange
+    //     default:
+    //         return .red
+    //     }
+    // }
 
     private var iconColor: Color {
         // White: curve cooldown (takes absolute priority)
@@ -314,6 +343,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let sensorManager = SensorManager()
     let fanManager = FanManager()
     let profileManager = ProfileManager()
+    let cpuManager = CPUManager()
+    let ramManager = RAMManager()
+    let gpuManager = GPUManager()
+    let batteryManager = BatteryManager()
+    let networkManager = NetworkManager()
+    let diskManager = DiskManager()
 
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
@@ -361,6 +396,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .environmentObject(sensorManager)
             .environmentObject(fanManager)
             .environmentObject(profileManager)
+            .environmentObject(cpuManager)
+            .environmentObject(ramManager)
+            .environmentObject(gpuManager)
+            .environmentObject(batteryManager)
+            .environmentObject(networkManager)
+            .environmentObject(diskManager)
 
         popover = NSPopover()
         popover.contentSize = NSSize(width: 380, height: 520)

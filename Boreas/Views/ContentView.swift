@@ -2,6 +2,12 @@ import SwiftUI
 
 enum SidebarItem: String, CaseIterable, Identifiable {
     case dashboard = "Dashboard"
+    case cpu = "CPU"
+    case gpu = "GPU"
+    case ram = "Memory"
+    case disk = "Disk"
+    case network = "Network"
+    case battery = "Battery"
     case fanControl = "Fan Control"
     case fanCurve = "Fan Curve"
     case sensors = "Sensors"
@@ -13,6 +19,12 @@ enum SidebarItem: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .dashboard: return "gauge.with.dots.needle.33percent"
+        case .cpu: return "cpu"
+        case .gpu: return "square.3.layers.3d.top.filled"
+        case .ram: return "memorychip"
+        case .disk: return "internaldrive"
+        case .network: return "network"
+        case .battery: return "battery.100percent"
         case .fanControl: return "fan.fill"
         case .fanCurve: return "chart.xyaxis.line"
         case .sensors: return "thermometer"
@@ -27,6 +39,12 @@ struct ContentView: View {
     @EnvironmentObject var sensorManager: SensorManager
     @EnvironmentObject var fanManager: FanManager
     @EnvironmentObject var profileManager: ProfileManager
+    @EnvironmentObject var cpuManager: CPUManager
+    @EnvironmentObject var ramManager: RAMManager
+    @EnvironmentObject var gpuManager: GPUManager
+    @EnvironmentObject var batteryManager: BatteryManager
+    @EnvironmentObject var networkManager: NetworkManager
+    @EnvironmentObject var diskManager: DiskManager
 
     var body: some View {
         NavigationSplitView {
@@ -48,6 +66,18 @@ struct ContentView: View {
                 switch selectedItem {
                 case .dashboard:
                     DashboardView()
+                case .cpu:
+                    CPUView()
+                case .gpu:
+                    GPUView()
+                case .ram:
+                    RAMView()
+                case .disk:
+                    DiskView()
+                case .network:
+                    NetworkView()
+                case .battery:
+                    BatteryView()
                 case .fanControl:
                     FanControlView()
                 case .fanCurve:

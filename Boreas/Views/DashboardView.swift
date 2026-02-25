@@ -5,6 +5,12 @@ struct DashboardView: View {
     @EnvironmentObject var sensorManager: SensorManager
     @EnvironmentObject var fanManager: FanManager
     @EnvironmentObject var profileManager: ProfileManager
+    @EnvironmentObject var cpuManager: CPUManager
+    @EnvironmentObject var ramManager: RAMManager
+    @EnvironmentObject var gpuManager: GPUManager
+    @EnvironmentObject var batteryManager: BatteryManager
+    @EnvironmentObject var networkManager: NetworkManager
+    @EnvironmentObject var diskManager: DiskManager
 
     var body: some View {
         ScrollView {
@@ -36,6 +42,100 @@ struct DashboardView: View {
                     }
                 }
                 .padding(.horizontal)
+
+                // System Stats Overview
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Image(systemName: "desktopcomputer")
+                            .foregroundStyle(.blue)
+                        Text("System Overview")
+                            .font(.headline)
+                        Spacer()
+                    }
+                    .padding(.horizontal)
+
+                    LazyVGrid(columns: [
+                        GridItem(.flexible()),
+                        GridItem(.flexible()),
+                        GridItem(.flexible()),
+                    ], spacing: 12) {
+                        DashboardGaugeCard(
+                            title: "CPU",
+                            percent: cpuManager.usage.total,
+                            subtitle: String(format: "%.0f%% User · %.0f%% Sys", cpuManager.usage.user, cpuManager.usage.system),
+                            icon: "cpu",
+                            color: cpuGaugeColor
+                        )
+                        DashboardGaugeCard(
+                            title: "GPU",
+                            percent: gpuManager.usage.utilization,
+                            subtitle: gpuManager.usage.modelName,
+                            icon: "square.3.layers.3d.top.filled",
+                            color: gpuGaugeColor
+                        )
+                        DashboardGaugeCard(
+                            title: "RAM",
+                            percent: ramManager.memory.usagePercent,
+                            subtitle: "\(ByteFormatter.format(ramManager.memory.used)) / \(ByteFormatter.format(ramManager.memory.total))",
+                            icon: "memorychip",
+                            color: ramGaugeColor
+                        )
+                    }
+                    .padding(.horizontal)
+
+                    LazyVGrid(columns: [
+                        GridItem(.flexible()),
+                        GridItem(.flexible()),
+                        GridItem(.flexible()),
+                    ], spacing: 12) {
+                        StatCard(
+                            title: "Network ↓",
+                            value: ByteFormatter.formatSpeed(networkManager.stats.downloadBytesPerSec),
+                            icon: "arrow.down.circle.fill",
+                            color: .blue
+                        )
+                        StatCard(
+                            title: "Network ↑",
+                            value: ByteFormatter.formatSpeed(networkManager.stats.uploadBytesPerSec),
+                            icon: "arrow.up.circle.fill",
+                            color: .green
+                        )
+                        if let disk = diskManager.disks.first {
+                            StatCard(
+                                title: "Disk",
+                                value: String(format: "%.0f%% used", disk.usagePercent),
+                                icon: "internaldrive",
+                                color: disk.usagePercent > 90 ? .red : disk.usagePercent > 75 ? .orange : .blue
+                            )
+                        } else {
+                            StatCard(
+                                title: "Disk",
+                                value: "N/A",
+                                icon: "internaldrive",
+                                color: .gray
+                            )
+                        }
+                    }
+                    .padding(.horizontal)
+
+                    if batteryManager.battery.hasBattery {
+                        HStack(spacing: 12) {
+                            StatCard(
+                                title: "Battery",
+                                value: String(format: "%.0f%%", batteryManager.battery.level),
+                                icon: batteryManager.battery.isCharging ? "battery.100percent.bolt" : "battery.100percent",
+                                color: batteryManager.battery.level > 20 ? .green : .red
+                            )
+                            StatCard(
+                                title: "Battery Health",
+                                value: String(format: "%.0f%%", batteryManager.battery.healthPercent),
+                                icon: "heart.fill",
+                                color: batteryManager.battery.healthPercent > 80 ? .green : .yellow
+                            )
+                        }
+                        .padding(.horizontal)
+                    }
+                }
 
                 // Temperature Overview Cards
                 LazyVGrid(columns: [
@@ -85,7 +185,11 @@ struct DashboardView: View {
                         }
                         .pickerStyle(.segmented)
                     }
-                    TemperatureChartView(history: sensorManager.filteredHistory)
+                    TemperatureChartView(
+                        history: sensorManager.filteredHistory,
+                        range: sensorManager.historyRange,
+                        latestSnapshot: sensorManager.temperatureHistory.last
+                    )
                 }
                 .padding(.horizontal)
 
@@ -152,14 +256,112 @@ struct DashboardView: View {
         default: return .purple
         }
     }
+
+    private var cpuGaugeColor: Color {
+        let v = cpuManager.usage.total
+        if v < 30 { return .green }
+        if v < 60 { return .yellow }
+        if v < 80 { return .orange }
+        return .red
+    }
+
+    private var gpuGaugeColor: Color {
+        let v = gpuManager.usage.utilization
+        if v < 30 { return .green }
+        if v < 60 { return .yellow }
+        if v < 80 { return .orange }
+        return .red
+    }
+
+    private var ramGaugeColor: Color {
+        let v = ramManager.memory.usagePercent
+        if v < 50 { return .green }
+        if v < 75 { return .yellow }
+        if v < 90 { return .orange }
+        return .red
+    }
+}
+
+// MARK: - Dashboard Gauge Card
+
+struct DashboardGaugeCard: View {
+    let title: String
+    let percent: Double
+    let subtitle: String
+    let icon: String
+    let color: Color
+
+    var body: some View {
+        VStack(spacing: 8) {
+            ZStack {
+                Circle()
+                    .stroke(Color.secondary.opacity(0.15), lineWidth: 6)
+                Circle()
+                    .trim(from: 0, to: min(percent / 100, 1))
+                    .stroke(color, style: StrokeStyle(lineWidth: 6, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .animation(.easeInOut(duration: 0.3), value: percent)
+                VStack(spacing: 1) {
+                    Text(String(format: "%.0f%%", percent))
+                        .font(.system(size: 18, weight: .bold, design: .rounded))
+                    Image(systemName: icon)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(width: 64, height: 64)
+
+            Text(title)
+                .font(.caption)
+                .fontWeight(.medium)
+            Text(subtitle)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity)
+        .padding()
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+    }
 }
 
 // MARK: - Temperature History Chart
 
 struct TemperatureChartView: View {
     let history: [TemperatureSnapshot]
+    let range: HistoryRange
+    let latestSnapshot: TemperatureSnapshot?
 
-    private var chartDomain: ClosedRange<Double> {
+    private struct ChartSample: Identifiable {
+        let id = UUID()
+        let timestamp: Date
+        let avgCPU: Double
+        let maxCPU: Double
+        let avgGPU: Double
+        let maxGPU: Double
+
+        init(snapshot: TemperatureSnapshot) {
+            self.timestamp = snapshot.timestamp
+            self.avgCPU = snapshot.avgCPU
+            self.maxCPU = snapshot.maxCPU
+            self.avgGPU = snapshot.avgGPU
+            self.maxGPU = snapshot.maxGPU
+        }
+
+        init(timestamp: Date, avgCPU: Double, maxCPU: Double, avgGPU: Double, maxGPU: Double) {
+            self.timestamp = timestamp
+            self.avgCPU = avgCPU
+            self.maxCPU = maxCPU
+            self.avgGPU = avgGPU
+            self.maxGPU = maxGPU
+        }
+
+        func withTimestamp(_ timestamp: Date) -> ChartSample {
+            ChartSample(timestamp: timestamp, avgCPU: avgCPU, maxCPU: maxCPU, avgGPU: avgGPU, maxGPU: maxGPU)
+        }
+    }
+
+    private var chartYDomain: ClosedRange<Double> {
         let temps = history.flatMap { [$0.avgCPU, $0.maxCPU, $0.avgGPU, $0.maxGPU] }
         guard let minVal = temps.min(), let maxVal = temps.max() else { return 0...100 }
         let padding: Double = 8
@@ -167,6 +369,71 @@ struct TemperatureChartView: View {
         var upper = maxVal + padding
         if upper - lower < 20 { upper = lower + 20 }
         return lower...upper
+    }
+
+    private var chartXDomain: ClosedRange<Date> {
+        if let window = range.window {
+            let end = Date()
+            let start = end.addingTimeInterval(-window)
+            return start...end
+        }
+
+        if let first = history.first?.timestamp, let last = history.last?.timestamp {
+            if first == last {
+                let paddedStart = first.addingTimeInterval(-60)
+                let paddedEnd = last.addingTimeInterval(60)
+                return paddedStart...paddedEnd
+            }
+            return first...last
+        }
+
+        let end = Date()
+        return end.addingTimeInterval(-60)...end
+    }
+
+    private var chartSamples: [ChartSample] {
+        let domain = chartXDomain
+        let baselineValue = chartYDomain.lowerBound
+
+        func baselineSample(at timestamp: Date) -> ChartSample {
+            ChartSample(
+                timestamp: timestamp,
+                avgCPU: baselineValue,
+                maxCPU: baselineValue,
+                avgGPU: baselineValue,
+                maxGPU: baselineValue
+            )
+        }
+
+        if !history.isEmpty {
+            var samples: [ChartSample] = []
+            let actualSamples = history.map(ChartSample.init)
+
+            if let firstActual = actualSamples.first, firstActual.timestamp > domain.lowerBound {
+                samples.append(firstActual.withTimestamp(domain.lowerBound))
+            }
+
+            samples.append(contentsOf: actualSamples)
+
+            if let lastActual = actualSamples.last, lastActual.timestamp < domain.upperBound {
+                samples.append(lastActual.withTimestamp(domain.upperBound))
+            }
+
+            return samples
+        }
+
+        if let latestSnapshot {
+            let base = ChartSample(snapshot: latestSnapshot)
+            return [
+                base.withTimestamp(domain.lowerBound),
+                base.withTimestamp(domain.upperBound)
+            ]
+        }
+
+        return [
+            baselineSample(at: domain.lowerBound),
+            baselineSample(at: domain.upperBound)
+        ]
     }
 
     var body: some View {
@@ -184,7 +451,7 @@ struct TemperatureChartView: View {
                 }
             }
 
-            if history.count < 2 {
+            if chartSamples.isEmpty {
                 HStack {
                     Spacer()
                     VStack(spacing: 6) {
@@ -197,29 +464,29 @@ struct TemperatureChartView: View {
                     Spacer()
                 }
             } else {
-                Chart(history) { snapshot in
+                Chart(chartSamples) { sample in
                     LineMark(
-                        x: .value("Time", snapshot.id),
-                        y: .value("Temp", snapshot.avgCPU)
+                        x: .value("Time", sample.timestamp),
+                        y: .value("Temp", sample.avgCPU)
                     )
                     .foregroundStyle(by: .value("Series", "CPU Avg"))
 
                     LineMark(
-                        x: .value("Time", snapshot.id),
-                        y: .value("Temp", snapshot.maxCPU)
+                        x: .value("Time", sample.timestamp),
+                        y: .value("Temp", sample.maxCPU)
                     )
                     .foregroundStyle(by: .value("Series", "CPU Peak"))
                     .lineStyle(StrokeStyle(dash: [4, 3]))
 
                     LineMark(
-                        x: .value("Time", snapshot.id),
-                        y: .value("Temp", snapshot.avgGPU)
+                        x: .value("Time", sample.timestamp),
+                        y: .value("Temp", sample.avgGPU)
                     )
                     .foregroundStyle(by: .value("Series", "GPU Avg"))
 
                     LineMark(
-                        x: .value("Time", snapshot.id),
-                        y: .value("Temp", snapshot.maxGPU)
+                        x: .value("Time", sample.timestamp),
+                        y: .value("Temp", sample.maxGPU)
                     )
                     .foregroundStyle(by: .value("Series", "GPU Peak"))
                     .lineStyle(StrokeStyle(dash: [4, 3]))
@@ -230,7 +497,8 @@ struct TemperatureChartView: View {
                     "GPU Avg": Color.green,
                     "GPU Peak": Color.green.opacity(0.5),
                 ])
-                .chartYScale(domain: chartDomain)
+                .chartYScale(domain: chartYDomain)
+                .chartXScale(domain: chartXDomain)
                 .chartXAxis(.hidden)
                 .chartYAxis {
                     AxisMarks(position: .leading) { value in
