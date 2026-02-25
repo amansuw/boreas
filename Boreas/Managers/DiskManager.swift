@@ -3,14 +3,13 @@ import Combine
 import IOKit
 
 class DiskManager: ObservableObject {
-    @Published var disks: [DiskInfo] = []
-    @Published var io = DiskIO()
-    @Published var topProcesses: [TopProcess] = []
+    var disks: [DiskInfo] = []
+    var io = DiskIO()
+    var topProcesses: [TopProcess] = []
 
-    private var timer: Timer?
-    private var processTimer: Timer?
-    private let readQueue = DispatchQueue(label: "com.boreas.disk-read", qos: .utility)
-    private let processQueue = DispatchQueue(label: "com.boreas.disk-process", qos: .background)
+    // Pre-allocated buffers — reused every poll to avoid heap churn
+    private var pidBuffer = [Int32](repeating: 0, count: 2048)
+    private var nameBuffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
 
     // Previous I/O counters for delta
     private var prevReadBytes: UInt64 = 0
@@ -18,49 +17,29 @@ class DiskManager: ObservableObject {
     private var prevTimestamp: Date?
 
     init() {
-        startMonitoring()
     }
 
     deinit {
-        stopMonitoring()
     }
 
-    func startMonitoring() {
-        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.update()
-        }
-        RunLoop.main.add(timer!, forMode: .common)
+    // MARK: - Compute / Apply
 
-        processTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            self?.updateTopProcesses()
-        }
-        RunLoop.main.add(processTimer!, forMode: .common)
-
-        update()
-        updateTopProcesses()
+    func computeIO() -> DiskIO {
+        readDiskIO()
     }
 
-    func stopMonitoring() {
-        timer?.invalidate()
-        timer = nil
-        processTimer?.invalidate()
-        processTimer = nil
+    func applyIO(_ io: DiskIO) {
+        self.io = io
+        objectWillChange.send()
     }
 
-    // MARK: - Disk Space
+    func computeSpace() -> [DiskInfo] {
+        readDiskSpace()
+    }
 
-    private func update() {
-        readQueue.async { [weak self] in
-            guard let self = self else { return }
-
-            let diskInfos = self.readDiskSpace()
-            let ioStats = self.readDiskIO()
-
-            DispatchQueue.main.async {
-                self.disks = diskInfos
-                self.io = ioStats
-            }
-        }
+    func applySpace(_ infos: [DiskInfo]) {
+        self.disks = infos
+        objectWillChange.send()
     }
 
     private func readDiskSpace() -> [DiskInfo] {
@@ -157,35 +136,32 @@ class DiskManager: ObservableObject {
         return DiskIO(readBytesPerSec: readPerSec, writeBytesPerSec: writePerSec)
     }
 
-    // MARK: - Top Processes by Disk
+    func computeProcesses() -> [TopProcess] {
+        readTopProcesses(limit: 8)
+    }
 
-    private func updateTopProcesses() {
-        processQueue.async { [weak self] in
-            guard let self = self else { return }
-            let procs = self.readTopProcesses(limit: 8)
-            DispatchQueue.main.async {
-                self.topProcesses = procs
-            }
-        }
+    func applyProcesses(_ procs: [TopProcess]) {
+        topProcesses = procs
+        objectWillChange.send()
     }
 
     private func readTopProcesses(limit: Int) -> [TopProcess] {
-        var pids = [Int32](repeating: 0, count: 2048)
-        let bufferSize = proc_listpids(UInt32(PROC_ALL_PIDS), 0, &pids, Int32(MemoryLayout<Int32>.stride * pids.count))
+        let bufferSize = proc_listpids(UInt32(PROC_ALL_PIDS), 0, &pidBuffer, Int32(MemoryLayout<Int32>.stride * pidBuffer.count))
         guard bufferSize > 0 else { return [] }
         let count = Int(bufferSize) / MemoryLayout<Int32>.stride
 
         var processes: [TopProcess] = []
+        processes.reserveCapacity(min(count, 64))
 
         for i in 0..<count {
-            let pid = pids[i]
+            let pid = pidBuffer[i]
             guard pid > 0 else { continue }
 
             var taskInfo = proc_taskinfo()
             let size = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &taskInfo, Int32(MemoryLayout<proc_taskinfo>.size))
             guard size == MemoryLayout<proc_taskinfo>.size else { continue }
 
-            var nameBuffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+            nameBuffer[0] = 0
             proc_name(pid, &nameBuffer, UInt32(nameBuffer.count))
             let name = String(cString: nameBuffer)
             guard !name.isEmpty else { continue }

@@ -42,25 +42,23 @@ struct TemperatureSnapshot: Identifiable {
 }
 
 class SensorManager: ObservableObject {
-    @Published var readings: [SensorReading] = []
-    @Published var temperatureReadings: [SensorReading] = []
-    @Published var voltageReadings: [SensorReading] = []
-    @Published var currentReadings: [SensorReading] = []
-    @Published var powerReadings: [SensorReading] = []
-    @Published var isMonitoring = false
-    @Published var isDiscovering = true
-    @Published var temperatureHistory: [TemperatureSnapshot] = []
-    @Published var historyRange: HistoryRange = .max {
+    var readings: [SensorReading] = []
+    var temperatureReadings: [SensorReading] = []
+    var voltageReadings: [SensorReading] = []
+    var currentReadings: [SensorReading] = []
+    var powerReadings: [SensorReading] = []
+    var isMonitoring = false
+    var isDiscovering = true
+    var temperatureHistory: [TemperatureSnapshot] = []
+    var historyRange: HistoryRange = .max {
         didSet { scheduleFilteredHistoryUpdate() }
     }
-    @Published private(set) var filteredHistory: [TemperatureSnapshot] = []
+    private(set) var filteredHistory: [TemperatureSnapshot] = []
 
-    private var timer: Timer?
     private let smc = SMCKit.shared
     private var discoveredSensors: [(key: String, name: String, category: SensorCategory)] = []
-    private let discoveryQueue = DispatchQueue(label: "com.boreas.sensor-discovery", qos: .userInitiated)
-    private let readQueue = DispatchQueue(label: "com.boreas.sensor-read", qos: .utility)
-    private let maxHistoryPoints = 86400
+    private let maxHistoryPoints = 3600
+    private var updateCycleCount = 0
 
     init() {
         discoverSensors()
@@ -68,16 +66,14 @@ class SensorManager: ObservableObject {
     }
 
     deinit {
-        stopMonitoring()
     }
 
     // MARK: - Pure Dynamic Discovery
 
     func discoverSensors() {
         isDiscovering = true
-        stopMonitoring()
 
-        discoveryQueue.async { [weak self] in
+        MonitorQueues.fast.async { [weak self] in
             guard let self = self else { return }
 
             var sensors: [(key: String, name: String, category: SensorCategory)] = []
@@ -127,100 +123,106 @@ class SensorManager: ObservableObject {
             DispatchQueue.main.async {
                 self.discoveredSensors = sensors
                 self.isDiscovering = false
-                self.updateReadings()
-                self.startMonitoring()
+                self.objectWillChange.send()
             }
         }
     }
 
-    // MARK: - Monitoring
+    // MARK: - Polling (called by MonitorCoordinator on MonitorQueues.fast)
 
-    func startMonitoring() {
-        guard !isMonitoring else { return }
-        isMonitoring = true
+    // MARK: - Compute / Apply
 
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.updateReadings()
-        }
-        RunLoop.main.add(timer!, forMode: .common)
+    struct FastResult {
+        let all: [SensorReading]
+        let temp: [SensorReading]
+        let volt: [SensorReading]
+        let curr: [SensorReading]
+        let pow: [SensorReading]
+        let snapshot: TemperatureSnapshot
     }
 
-    func stopMonitoring() {
-        timer?.invalidate()
-        timer = nil
-        isMonitoring = false
-    }
+    // Scratch arrays reused each poll to avoid heap allocations
+    private var scratchAll: [SensorReading] = []
+    private var scratchTemp: [SensorReading] = []
+    private var scratchVolt: [SensorReading] = []
+    private var scratchCurr: [SensorReading] = []
+    private var scratchPow: [SensorReading] = []
 
-    func updateReadings() {
-        // Read sensors on background queue to avoid blocking main thread
-        readQueue.async { [weak self] in
-            guard let self = self else { return }
+    func computeReadings() -> FastResult? {
+        guard !discoveredSensors.isEmpty else { return nil }
 
-            var allReadings: [SensorReading] = []
-            var tempReadings: [SensorReading] = []
-            var voltReadings: [SensorReading] = []
-            var currReadings: [SensorReading] = []
-            var powReadings: [SensorReading] = []
+        scratchAll.removeAll(keepingCapacity: true)
+        scratchTemp.removeAll(keepingCapacity: true)
+        scratchVolt.removeAll(keepingCapacity: true)
+        scratchCurr.removeAll(keepingCapacity: true)
+        scratchPow.removeAll(keepingCapacity: true)
 
-            // Pre-filter by category during read to avoid multiple filter passes
-            for sensor in self.discoveredSensors {
-                guard let val = self.smc.readKey(sensor.key) else { continue }
-                guard let value = self.smc.decodeValue(val),
-                      value.isFinite,
-                      SensorLookup.isReasonableValue(value, for: sensor.category) else { continue }
+        var cpuTempSum = 0.0, cpuTempMax = 0.0, cpuTempCount = 0
+        var gpuTempSum = 0.0, gpuTempMax = 0.0, gpuTempCount = 0
 
-                let reading = SensorReading(
-                    id: sensor.key,
-                    name: sensor.name,
-                    category: sensor.category,
-                    value: value,
-                    key: sensor.key
-                )
-                allReadings.append(reading)
+        for sensor in discoveredSensors {
+            guard let val = smc.readKey(sensor.key) else { continue }
+            guard let value = smc.decodeValue(val),
+                  value.isFinite,
+                  SensorLookup.isReasonableValue(value, for: sensor.category) else { continue }
 
-                switch sensor.category {
-                case .temperature: tempReadings.append(reading)
-                case .voltage: voltReadings.append(reading)
-                case .current: currReadings.append(reading)
-                case .power: powReadings.append(reading)
-                case .fan: break
-                }
-            }
-
-            // Calculate aggregates on background thread
-            let cpuTemps = tempReadings.filter {
-                $0.key.hasPrefix("TC") || $0.key.hasPrefix("Tc")
-            }
-            let gpuTemps = tempReadings.filter {
-                $0.key.hasPrefix("TG") || $0.key.hasPrefix("Tg")
-            }
-            let avgCPU = cpuTemps.isEmpty ? 0 : cpuTemps.map(\.value).reduce(0, +) / Double(cpuTemps.count)
-            let maxCPU = cpuTemps.map(\.value).max() ?? 0
-            let avgGPU = gpuTemps.isEmpty ? 0 : gpuTemps.map(\.value).reduce(0, +) / Double(gpuTemps.count)
-            let maxGPU = gpuTemps.map(\.value).max() ?? 0
-
-            let snapshot = TemperatureSnapshot(
-                timestamp: Date(),
-                avgCPU: avgCPU,
-                avgGPU: avgGPU,
-                maxCPU: maxCPU,
-                maxGPU: maxGPU
+            let reading = SensorReading(
+                id: sensor.key,
+                name: sensor.name,
+                category: sensor.category,
+                value: value,
+                key: sensor.key
             )
+            scratchAll.append(reading)
 
-            // Batch all @Published updates together on main thread
-            DispatchQueue.main.async {
-                self.readings = allReadings
-                self.temperatureReadings = tempReadings
-                self.voltageReadings = voltReadings
-                self.currentReadings = currReadings
-                self.powerReadings = powReadings
-                self.temperatureHistory.append(snapshot)
-                if self.temperatureHistory.count > self.maxHistoryPoints {
-                    self.temperatureHistory.removeFirst(self.temperatureHistory.count - self.maxHistoryPoints)
+            switch sensor.category {
+            case .temperature:
+                scratchTemp.append(reading)
+                let k = sensor.key
+                if k.hasPrefix("TC") || k.hasPrefix("Tc") {
+                    cpuTempSum += value; cpuTempMax = max(cpuTempMax, value); cpuTempCount += 1
+                } else if k.hasPrefix("TG") || k.hasPrefix("Tg") {
+                    gpuTempSum += value; gpuTempMax = max(gpuTempMax, value); gpuTempCount += 1
                 }
-                self.updateFilteredHistory()
+            case .voltage: scratchVolt.append(reading)
+            case .current: scratchCurr.append(reading)
+            case .power: scratchPow.append(reading)
+            case .fan: break
             }
         }
+
+        let avgCPU = cpuTempCount > 0 ? cpuTempSum / Double(cpuTempCount) : 0
+        let avgGPU = gpuTempCount > 0 ? gpuTempSum / Double(gpuTempCount) : 0
+
+        return FastResult(
+            all: scratchAll,
+            temp: scratchTemp,
+            volt: scratchVolt,
+            curr: scratchCurr,
+            pow: scratchPow,
+            snapshot: TemperatureSnapshot(
+                timestamp: Date(), avgCPU: avgCPU, avgGPU: avgGPU,
+                maxCPU: cpuTempMax, maxGPU: gpuTempMax
+            )
+        )
+    }
+
+    func applyReadings(_ r: FastResult) {
+        readings = r.all
+        temperatureReadings = r.temp
+        voltageReadings = r.volt
+        currentReadings = r.curr
+        powerReadings = r.pow
+        isMonitoring = true
+        temperatureHistory.append(r.snapshot)
+        if temperatureHistory.count > maxHistoryPoints {
+            temperatureHistory.removeSubrange(0..<(temperatureHistory.count - maxHistoryPoints))
+        }
+        updateCycleCount += 1
+        if updateCycleCount % 5 == 0 {
+            updateFilteredHistory()
+        }
+        objectWillChange.send()
     }
 
     // MARK: - Computed Aggregates
@@ -263,7 +265,9 @@ class SensorManager: ObservableObject {
     // MARK: - History helpers
 
     private func scheduleFilteredHistoryUpdate() {
-        DispatchQueue.main.async { [weak self] in
+        // Use Task to defer past the current SwiftUI render pass,
+        // preventing "Publishing changes from within view updates" warning.
+        Task { @MainActor [weak self] in
             self?.updateFilteredHistory()
         }
     }
@@ -273,10 +277,12 @@ class SensorManager: ObservableObject {
         let base = temperatureHistory
         guard let window else {
             filteredHistory = base
+            objectWillChange.send()
             return
         }
         let cutoff = Date().addingTimeInterval(-window)
         filteredHistory = base.filter { $0.timestamp >= cutoff }
+        objectWillChange.send()
     }
 
     // MARK: - Dashboard Curated Sensors

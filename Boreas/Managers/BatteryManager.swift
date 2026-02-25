@@ -4,40 +4,23 @@ import IOKit
 import IOKit.ps
 
 class BatteryManager: ObservableObject {
-    @Published var battery = BatteryInfo()
-
-    private var timer: Timer?
-    private let readQueue = DispatchQueue(label: "com.boreas.battery-read", qos: .utility)
+    var battery = BatteryInfo()
 
     init() {
-        startMonitoring()
     }
 
     deinit {
-        stopMonitoring()
     }
 
-    func startMonitoring() {
-        timer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            self?.update()
-        }
-        RunLoop.main.add(timer!, forMode: .common)
-        update()
+    // MARK: - Compute / Apply
+
+    func computeBattery() -> BatteryInfo {
+        readBattery()
     }
 
-    func stopMonitoring() {
-        timer?.invalidate()
-        timer = nil
-    }
-
-    private func update() {
-        readQueue.async { [weak self] in
-            guard let self = self else { return }
-            let info = self.readBattery()
-            DispatchQueue.main.async {
-                self.battery = info
-            }
-        }
+    func applyBattery(_ info: BatteryInfo) {
+        battery = info
+        objectWillChange.send()
     }
 
     // MARK: - Battery Reading via IOKit

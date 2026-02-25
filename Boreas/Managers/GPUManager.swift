@@ -3,27 +3,31 @@ import Combine
 import IOKit
 
 class GPUManager: ObservableObject {
-    @Published var usage = GPUUsage()
-    @Published var topProcesses: [TopProcess] = []
-    @Published var usageHistory: [GPUSnapshot] = []
+    var usage = GPUUsage()
+    var topProcesses: [TopProcess] = []
+    var usageHistory: [GPUSnapshot] = []
 
-    private var timer: Timer?
-    private let readQueue = DispatchQueue(label: "com.boreas.gpu-read", qos: .utility)
-    private let maxHistoryPoints = 86400
+    private let maxHistoryPoints = 1800
 
     struct GPUSnapshot: Identifiable {
-        let id = UUID()
+        private static var counter: Int = 0
+        let id: Int
         let timestamp: Date
         let utilization: Double
+
+        init(timestamp: Date, utilization: Double) {
+            GPUSnapshot.counter += 1
+            self.id = GPUSnapshot.counter
+            self.timestamp = timestamp
+            self.utilization = utilization
+        }
     }
 
     init() {
         detectGPUModel()
-        startMonitoring()
     }
 
     deinit {
-        stopMonitoring()
     }
 
     // MARK: - GPU Model Detection
@@ -84,41 +88,35 @@ class GPUManager: ObservableObject {
         usage.modelName = "GPU"
     }
 
-    // MARK: - Monitoring
+    // MARK: - Compute / Apply
 
-    func startMonitoring() {
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.update()
-        }
-        RunLoop.main.add(timer!, forMode: .common)
-        update()
+    struct FastResult {
+        let utilization: Double
+        let renderUtilization: Double
+        let tilerUtilization: Double
+        let snapshot: GPUSnapshot
     }
 
-    func stopMonitoring() {
-        timer?.invalidate()
-        timer = nil
+    func computeUsage() -> FastResult {
+        let stats = readGPUStats()
+        let snapshot = GPUSnapshot(timestamp: Date(), utilization: stats.utilization)
+        return FastResult(
+            utilization: stats.utilization,
+            renderUtilization: stats.renderUtilization,
+            tilerUtilization: stats.tilerUtilization,
+            snapshot: snapshot
+        )
     }
 
-    // MARK: - GPU Utilization via IOKit
-
-    private func update() {
-        readQueue.async { [weak self] in
-            guard let self = self else { return }
-            let stats = self.readGPUStats()
-            let snapshot = GPUSnapshot(
-                timestamp: Date(),
-                utilization: stats.utilization
-            )
-            DispatchQueue.main.async {
-                self.usage.utilization = stats.utilization
-                self.usage.renderUtilization = stats.renderUtilization
-                self.usage.tilerUtilization = stats.tilerUtilization
-                self.usageHistory.append(snapshot)
-                if self.usageHistory.count > self.maxHistoryPoints {
-                    self.usageHistory.removeFirst(self.usageHistory.count - self.maxHistoryPoints)
-                }
-            }
+    func applyUsage(_ r: FastResult) {
+        usage.utilization = r.utilization
+        usage.renderUtilization = r.renderUtilization
+        usage.tilerUtilization = r.tilerUtilization
+        usageHistory.append(r.snapshot)
+        if usageHistory.count > maxHistoryPoints {
+            usageHistory.removeSubrange(0..<(usageHistory.count - maxHistoryPoints))
         }
+        objectWillChange.send()
     }
 
     private func readGPUStats() -> (utilization: Double, renderUtilization: Double, tilerUtilization: Double) {

@@ -86,6 +86,8 @@ class SMCKit {
     private var connection: io_connect_t = 0
     private(set) var isOpen = false
 
+    private var keyInfoCache: [UInt32: SMCKeyData.KeyInfo] = [:]
+
     private init() {
         open()
     }
@@ -251,30 +253,36 @@ class SMCKit {
     }
 
     func readKey(_ key: String) -> SMCVal? {
-        // Step 1: Get key info
-        var inputData = SMCKeyData()
-        inputData.key = stringToUInt32(key)
+        let keyInt = stringToUInt32(key)
 
-        guard let keyInfoResult = callSMC(command: kSMCCmdGetKeyInfo, inputData: &inputData) else {
-            return nil
+        // Step 1: Get key info — use cache to avoid redundant kernel call
+        let info: SMCKeyData.KeyInfo
+        if let cached = keyInfoCache[keyInt] {
+            info = cached
+        } else {
+            var inputData = SMCKeyData()
+            inputData.key = keyInt
+            guard let keyInfoResult = callSMC(command: kSMCCmdGetKeyInfo, inputData: &inputData) else {
+                return nil
+            }
+            guard keyInfoResult.keyInfo.dataSize > 0 else { return nil }
+            info = keyInfoResult.keyInfo
+            keyInfoCache[keyInt] = info
         }
-
-        let dataSize = keyInfoResult.keyInfo.dataSize
-        guard dataSize > 0 else { return nil }
 
         // Step 2: Read key value
         var readData = SMCKeyData()
-        readData.key = stringToUInt32(key)
-        readData.keyInfo.dataSize = dataSize
+        readData.key = keyInt
+        readData.keyInfo.dataSize = info.dataSize
 
         guard let readResult = callSMC(command: kSMCCmdReadKey, inputData: &readData) else {
             return nil
         }
 
-        let dataType = uint32ToString(keyInfoResult.keyInfo.dataType)
-        let bytes = bytesFromTuple(readResult.bytes, count: Int(dataSize))
+        let dataType = uint32ToString(info.dataType)
+        let bytes = bytesFromTuple(readResult.bytes, count: Int(info.dataSize))
 
-        return SMCVal(key: key, dataSize: dataSize, dataType: dataType, bytes: bytes)
+        return SMCVal(key: key, dataSize: info.dataSize, dataType: dataType, bytes: bytes)
     }
 
     func writeKey(_ key: String, bytes: [UInt8]) -> Bool {

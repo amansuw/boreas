@@ -3,14 +3,11 @@ import Combine
 import SystemConfiguration
 
 class NetworkManager: ObservableObject {
-    @Published var stats = NetworkStats()
-    @Published var topProcesses: [TopProcess] = []
-    @Published var history: [NetworkSnapshot] = []
+    var stats = NetworkStats()
+    var topProcesses: [TopProcess] = []
+    var history: [NetworkSnapshot] = []
 
-    private var timer: Timer?
-    private var publicIPTimer: Timer?
-    private let readQueue = DispatchQueue(label: "com.boreas.network-read", qos: .utility)
-    private let maxHistoryPoints = 86400
+    private let maxHistoryPoints = 1800
 
     // Previous byte counts for delta calculation
     private var prevBytesIn: UInt64 = 0
@@ -21,138 +18,120 @@ class NetworkManager: ObservableObject {
     private var latencySamples: [Double] = []
 
     init() {
-        startMonitoring()
-    }
-
-    deinit {
-        stopMonitoring()
-    }
-
-    func startMonitoring() {
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.update()
-        }
-        RunLoop.main.add(timer!, forMode: .common)
-
-        // Public IP every 60s
-        publicIPTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { [weak self] _ in
-            self?.fetchPublicIP()
-        }
-        RunLoop.main.add(publicIPTimer!, forMode: .common)
-
-        update()
-        fetchPublicIP()
         fetchDNSServers()
     }
 
-    func stopMonitoring() {
-        timer?.invalidate()
-        timer = nil
-        publicIPTimer?.invalidate()
-        publicIPTimer = nil
+    deinit {
     }
 
-    // MARK: - Network Stats via getifaddrs
+    // MARK: - Compute / Apply
 
-    private func update() {
-        readQueue.async { [weak self] in
-            guard let self = self else { return }
+    struct FastResult {
+        let dlSpeed: UInt64
+        let ulSpeed: UInt64
+        let totalIn: UInt64
+        let totalOut: UInt64
+        let activeIface: NetworkInterface?
+        let snapshot: NetworkSnapshot
+    }
 
-            var totalIn: UInt64 = 0
-            var totalOut: UInt64 = 0
-            var activeIface: NetworkInterface?
+    func computeStats() -> FastResult {
+        var totalIn: UInt64 = 0
+        var totalOut: UInt64 = 0
+        var activeIface: NetworkInterface?
 
-            var ifaddr: UnsafeMutablePointer<ifaddrs>?
-            guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return }
-            defer { freeifaddrs(ifaddr) }
-
-            var ptr: UnsafeMutablePointer<ifaddrs>? = firstAddr
-            while let addr = ptr {
-                let name = String(cString: addr.pointee.ifa_name)
-                let flags = Int32(addr.pointee.ifa_flags)
-                let isUp = (flags & IFF_UP) != 0
-                let isLoopback = (flags & IFF_LOOPBACK) != 0
-
-                // Get byte counts from AF_LINK
-                if addr.pointee.ifa_addr.pointee.sa_family == UInt8(AF_LINK) && !isLoopback {
-                    addr.pointee.ifa_data.withMemoryRebound(to: if_data.self, capacity: 1) { data in
-                        totalIn += UInt64(data.pointee.ifi_ibytes)
-                        totalOut += UInt64(data.pointee.ifi_obytes)
-                    }
-                }
-
-                // Get IP address from AF_INET
-                if addr.pointee.ifa_addr.pointee.sa_family == UInt8(AF_INET) && isUp && !isLoopback {
-                    var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                    getnameinfo(addr.pointee.ifa_addr, socklen_t(addr.pointee.ifa_addr.pointee.sa_len),
-                                &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
-                    let ip = String(cString: hostname)
-
-                    if !ip.isEmpty && ip != "127.0.0.1" && activeIface == nil {
-                        var iface = NetworkInterface(id: name)
-                        iface.localIP = ip
-                        iface.isUp = isUp
-                        iface.displayName = self.interfaceDisplayName(name)
-
-                        // Get MAC address
-                        iface.macAddress = self.getMACAddress(for: name, firstAddr: firstAddr)
-
-                        // Get link speed
-                        self.getLinkSpeed(for: name, firstAddr: firstAddr, iface: &iface)
-
-                        activeIface = iface
-                    }
-                }
-
-                // Get IPv6
-                if addr.pointee.ifa_addr.pointee.sa_family == UInt8(AF_INET6) && isUp && !isLoopback {
-                    var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                    getnameinfo(addr.pointee.ifa_addr, socklen_t(addr.pointee.ifa_addr.pointee.sa_len),
-                                &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
-                    let ip6 = String(cString: hostname)
-                    if !ip6.hasPrefix("fe80") && !ip6.isEmpty {
-                        activeIface?.ipv6 = ip6
-                    }
-                }
-
-                ptr = addr.pointee.ifa_next
-            }
-
-            // Calculate speed deltas
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else {
             let now = Date()
-            var dlSpeed: UInt64 = 0
-            var ulSpeed: UInt64 = 0
+            return FastResult(dlSpeed: 0, ulSpeed: 0, totalIn: 0, totalOut: 0, activeIface: nil,
+                              snapshot: NetworkSnapshot(timestamp: now, downloadBytesPerSec: 0, uploadBytesPerSec: 0))
+        }
+        defer { freeifaddrs(ifaddr) }
 
-            if let prevTime = self.prevTimestamp {
-                let elapsed = now.timeIntervalSince(prevTime)
-                if elapsed > 0 && totalIn >= self.prevBytesIn && totalOut >= self.prevBytesOut {
-                    dlSpeed = UInt64(Double(totalIn - self.prevBytesIn) / elapsed)
-                    ulSpeed = UInt64(Double(totalOut - self.prevBytesOut) / elapsed)
+        var ptr: UnsafeMutablePointer<ifaddrs>? = firstAddr
+        while let addr = ptr {
+            let name = String(cString: addr.pointee.ifa_name)
+            let flags = Int32(addr.pointee.ifa_flags)
+            let isUp = (flags & IFF_UP) != 0
+            let isLoopback = (flags & IFF_LOOPBACK) != 0
+
+            if addr.pointee.ifa_addr.pointee.sa_family == UInt8(AF_LINK) && !isLoopback {
+                addr.pointee.ifa_data.withMemoryRebound(to: if_data.self, capacity: 1) { data in
+                    totalIn += UInt64(data.pointee.ifi_ibytes)
+                    totalOut += UInt64(data.pointee.ifi_obytes)
                 }
             }
 
-            self.prevBytesIn = totalIn
-            self.prevBytesOut = totalOut
-            self.prevTimestamp = now
+            if addr.pointee.ifa_addr.pointee.sa_family == UInt8(AF_INET) && isUp && !isLoopback {
+                var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                getnameinfo(addr.pointee.ifa_addr, socklen_t(addr.pointee.ifa_addr.pointee.sa_len),
+                            &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
+                let ip = String(cString: hostname)
 
-            let snapshot = NetworkSnapshot(
-                timestamp: now,
-                downloadBytesPerSec: dlSpeed,
-                uploadBytesPerSec: ulSpeed
-            )
-
-            DispatchQueue.main.async {
-                self.stats.downloadBytesPerSec = dlSpeed
-                self.stats.uploadBytesPerSec = ulSpeed
-                self.stats.totalDownload = totalIn
-                self.stats.totalUpload = totalOut
-                self.stats.activeInterface = activeIface
-                self.history.append(snapshot)
-                if self.history.count > self.maxHistoryPoints {
-                    self.history.removeFirst(self.history.count - self.maxHistoryPoints)
+                if !ip.isEmpty && ip != "127.0.0.1" && activeIface == nil {
+                    var iface = NetworkInterface(id: name)
+                    iface.localIP = ip
+                    iface.isUp = isUp
+                    iface.displayName = interfaceDisplayName(name)
+                    iface.macAddress = getMACAddress(for: name, firstAddr: firstAddr)
+                    getLinkSpeed(for: name, firstAddr: firstAddr, iface: &iface)
+                    activeIface = iface
                 }
+            }
+
+            if addr.pointee.ifa_addr.pointee.sa_family == UInt8(AF_INET6) && isUp && !isLoopback {
+                var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                getnameinfo(addr.pointee.ifa_addr, socklen_t(addr.pointee.ifa_addr.pointee.sa_len),
+                            &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
+                let ip6 = String(cString: hostname)
+                if !ip6.hasPrefix("fe80") && !ip6.isEmpty {
+                    activeIface?.ipv6 = ip6
+                }
+            }
+
+            ptr = addr.pointee.ifa_next
+        }
+
+        let now = Date()
+        var dlSpeed: UInt64 = 0
+        var ulSpeed: UInt64 = 0
+
+        if let prevTime = prevTimestamp {
+            let elapsed = now.timeIntervalSince(prevTime)
+            if elapsed > 0 && totalIn >= prevBytesIn && totalOut >= prevBytesOut {
+                dlSpeed = UInt64(Double(totalIn - prevBytesIn) / elapsed)
+                ulSpeed = UInt64(Double(totalOut - prevBytesOut) / elapsed)
             }
         }
+
+        prevBytesIn = totalIn
+        prevBytesOut = totalOut
+        prevTimestamp = now
+
+        let snapshot = NetworkSnapshot(
+            timestamp: now,
+            downloadBytesPerSec: dlSpeed,
+            uploadBytesPerSec: ulSpeed
+        )
+
+        return FastResult(
+            dlSpeed: dlSpeed, ulSpeed: ulSpeed,
+            totalIn: totalIn, totalOut: totalOut,
+            activeIface: activeIface, snapshot: snapshot
+        )
+    }
+
+    func applyStats(_ r: FastResult) {
+        stats.downloadBytesPerSec = r.dlSpeed
+        stats.uploadBytesPerSec = r.ulSpeed
+        stats.totalDownload = r.totalIn
+        stats.totalUpload = r.totalOut
+        stats.activeInterface = r.activeIface
+        history.append(r.snapshot)
+        if history.count > maxHistoryPoints {
+            history.removeSubrange(0..<(history.count - maxHistoryPoints))
+        }
+        objectWillChange.send()
     }
 
     // MARK: - Interface helpers
@@ -170,7 +149,7 @@ class NetworkManager: ObservableObject {
         while let addr = ptr {
             let name = String(cString: addr.pointee.ifa_name)
             if name == interfaceName && addr.pointee.ifa_addr.pointee.sa_family == UInt8(AF_LINK) {
-                var mac = addr.pointee.ifa_addr.withMemoryRebound(to: sockaddr_dl.self, capacity: 1) { sdl -> String in
+                let mac = addr.pointee.ifa_addr.withMemoryRebound(to: sockaddr_dl.self, capacity: 1) { sdl -> String in
                     let addrLen = Int(sdl.pointee.sdl_alen)
                     guard addrLen == 6 else { return "" }
                     let dataStart = withUnsafePointer(to: &sdl.pointee.sdl_data) { ptr in
@@ -207,12 +186,11 @@ class NetworkManager: ObservableObject {
     // MARK: - DNS Servers
 
     private func fetchDNSServers() {
-        readQueue.async { [weak self] in
+        MonitorQueues.fast.async { [weak self] in
             guard let self = self else { return }
 
             var servers: [String] = []
 
-            // Read from SCDynamicStore
             if let store = SCDynamicStoreCreate(nil, "Boreas" as CFString, nil, nil) {
                 let key = "State:/Network/Global/DNS" as CFString
                 if let dnsDict = SCDynamicStoreCopyValue(store, key) as? [String: Any],
@@ -227,9 +205,9 @@ class NetworkManager: ObservableObject {
         }
     }
 
-    // MARK: - Public IP
+    // MARK: - Public IP (called by MonitorCoordinator on MonitorQueues.slow)
 
-    private func fetchPublicIP() {
+    func pollPublicIP() {
         let url = URL(string: "https://api.ipify.org")!
         URLSession.shared.dataTask(with: url) { [weak self] data, _, error in
             guard let data = data, error == nil,

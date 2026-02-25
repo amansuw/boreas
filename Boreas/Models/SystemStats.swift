@@ -113,10 +113,19 @@ struct NetworkStats {
 }
 
 struct NetworkSnapshot: Identifiable {
-    let id = UUID()
+    private static var counter: Int = 0
+    let id: Int
     let timestamp: Date
     let downloadBytesPerSec: UInt64
     let uploadBytesPerSec: UInt64
+
+    init(timestamp: Date, downloadBytesPerSec: UInt64, uploadBytesPerSec: UInt64) {
+        NetworkSnapshot.counter += 1
+        self.id = NetworkSnapshot.counter
+        self.timestamp = timestamp
+        self.downloadBytesPerSec = downloadBytesPerSec
+        self.uploadBytesPerSec = uploadBytesPerSec
+    }
 }
 
 // MARK: - Battery

@@ -1,73 +1,92 @@
 import Foundation
 import Combine
+import Dispatch
 
 class RAMManager: ObservableObject {
-    @Published var memory = MemoryBreakdown()
-    @Published var topProcesses: [TopProcess] = []
-    @Published var usageHistory: [RAMSnapshot] = []
+    var memory = MemoryBreakdown()
+    var topProcesses: [TopProcess] = []
+    var usageHistory: [RAMSnapshot] = []
 
-    private var timer: Timer?
-    private var processTimer: Timer?
-    private let readQueue = DispatchQueue(label: "com.boreas.ram-read", qos: .utility)
-    private let processQueue = DispatchQueue(label: "com.boreas.ram-process", qos: .background)
     private let maxHistoryPoints = 120
 
+    // Pre-allocated buffers — reused every poll to avoid heap churn
+    private var pidBuffer = [Int32](repeating: 0, count: 2048)
+    private var nameBuffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+
+    // Kernel memory pressure tracking
+    private var pressureSource: DispatchSourceMemoryPressure?
+    private var currentPressureLevel: Int = 1 // 1=normal, 2=warning, 4=critical
+
     struct RAMSnapshot: Identifiable {
-        let id = UUID()
+        private static var counter: Int = 0
+        let id: Int
         let timestamp: Date
         let usagePercent: Double
         let pressure: Int
+
+        init(timestamp: Date, usagePercent: Double, pressure: Int) {
+            RAMSnapshot.counter += 1
+            self.id = RAMSnapshot.counter
+            self.timestamp = timestamp
+            self.usagePercent = usagePercent
+            self.pressure = pressure
+        }
     }
 
     init() {
-        startMonitoring()
+        setupMemoryPressureMonitoring()
     }
 
     deinit {
-        stopMonitoring()
+        pressureSource?.cancel()
+        pressureSource = nil
     }
-
-    func startMonitoring() {
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.update()
-        }
-        RunLoop.main.add(timer!, forMode: .common)
-
-        processTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
-            self?.updateTopProcesses()
-        }
-        RunLoop.main.add(processTimer!, forMode: .common)
-
-        update()
-        updateTopProcesses()
-    }
-
-    func stopMonitoring() {
-        timer?.invalidate()
-        timer = nil
-        processTimer?.invalidate()
-        processTimer = nil
-    }
-
-    // MARK: - Memory Stats
-
-    private func update() {
-        readQueue.async { [weak self] in
+    
+    // MARK: - Memory Pressure Monitoring (Kernel API)
+    
+    private func setupMemoryPressureMonitoring() {
+        let source = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.normal, .warning, .critical],
+            queue: .main
+        )
+        
+        source.setEventHandler { [weak self] in
             guard let self = self else { return }
-            let mem = self.readMemory()
-            let snapshot = RAMSnapshot(
-                timestamp: Date(),
-                usagePercent: mem.usagePercent,
-                pressure: mem.pressureLevel
-            )
-            DispatchQueue.main.async {
-                self.memory = mem
-                self.usageHistory.append(snapshot)
-                if self.usageHistory.count > self.maxHistoryPoints {
-                    self.usageHistory.removeFirst(self.usageHistory.count - self.maxHistoryPoints)
-                }
+            let event = source.data
+            
+            if event.contains(.critical) {
+                self.currentPressureLevel = 4
+            } else if event.contains(.warning) {
+                self.currentPressureLevel = 2
+            } else {
+                self.currentPressureLevel = 1
             }
         }
+        
+        source.resume()
+        pressureSource = source
+    }
+
+    // MARK: - Compute / Apply
+
+    struct FastResult {
+        let memory: MemoryBreakdown
+        let snapshot: RAMSnapshot
+    }
+
+    func computeMemory() -> FastResult {
+        let mem = readMemory()
+        let snapshot = RAMSnapshot(timestamp: Date(), usagePercent: mem.usagePercent, pressure: mem.pressureLevel)
+        return FastResult(memory: mem, snapshot: snapshot)
+    }
+
+    func applyMemory(_ r: FastResult) {
+        memory = r.memory
+        usageHistory.append(r.snapshot)
+        if usageHistory.count > maxHistoryPoints {
+            usageHistory.removeSubrange(0..<(usageHistory.count - maxHistoryPoints))
+        }
+        objectWillChange.send()
     }
 
     private func readMemory() -> MemoryBreakdown {
@@ -99,7 +118,10 @@ class RAMManager: ObservableObject {
         let purgeablePages = UInt64(vmStats.purgeable_count)
         mem.app = (internalPages - purgeablePages) * pageSize
 
-        mem.used = mem.total - mem.free
+        // CORRECT memory calculation for macOS:
+        // Used = App + Wired + Compressed (actual memory in use)
+        // NOT total - free (which incorrectly includes file cache as "used")
+        mem.used = mem.app + mem.wired + mem.compressed
 
         // Swap
         var swapUsage = xsw_usage()
@@ -108,50 +130,39 @@ class RAMManager: ObservableObject {
             mem.swap = UInt64(swapUsage.xsu_used)
         }
 
-        // Memory pressure level
-        // 1 = normal, 2 = warning, 4 = critical
-        // We approximate from free memory ratio
-        let freeRatio = Double(mem.free) / Double(mem.total)
-        if freeRatio > 0.15 {
-            mem.pressureLevel = 1
-        } else if freeRatio > 0.05 {
-            mem.pressureLevel = 2
-        } else {
-            mem.pressureLevel = 4
-        }
+        // Use kernel memory pressure level from dispatch source (accurate)
+        // instead of free ratio heuristic (always shows critical on macOS)
+        mem.pressureLevel = currentPressureLevel
 
         return mem
     }
 
-    // MARK: - Top Processes
+    func computeProcesses() -> [TopProcess] {
+        readTopProcesses(limit: 8)
+    }
 
-    private func updateTopProcesses() {
-        processQueue.async { [weak self] in
-            guard let self = self else { return }
-            let procs = self.readTopProcesses(limit: 8)
-            DispatchQueue.main.async {
-                self.topProcesses = procs
-            }
-        }
+    func applyProcesses(_ procs: [TopProcess]) {
+        topProcesses = procs
+        objectWillChange.send()
     }
 
     private func readTopProcesses(limit: Int) -> [TopProcess] {
-        var pids = [Int32](repeating: 0, count: 2048)
-        let bufferSize = proc_listpids(UInt32(PROC_ALL_PIDS), 0, &pids, Int32(MemoryLayout<Int32>.stride * pids.count))
+        let bufferSize = proc_listpids(UInt32(PROC_ALL_PIDS), 0, &pidBuffer, Int32(MemoryLayout<Int32>.stride * pidBuffer.count))
         guard bufferSize > 0 else { return [] }
         let count = Int(bufferSize) / MemoryLayout<Int32>.stride
 
         var processes: [TopProcess] = []
+        processes.reserveCapacity(min(count, 64))
 
         for i in 0..<count {
-            let pid = pids[i]
+            let pid = pidBuffer[i]
             guard pid > 0 else { continue }
 
             var taskInfo = proc_taskinfo()
             let size = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &taskInfo, Int32(MemoryLayout<proc_taskinfo>.size))
             guard size == MemoryLayout<proc_taskinfo>.size else { continue }
 
-            var nameBuffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+            nameBuffer[0] = 0
             proc_name(pid, &nameBuffer, UInt32(nameBuffer.count))
             let name = String(cString: nameBuffer)
             guard !name.isEmpty else { continue }

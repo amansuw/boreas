@@ -3,18 +3,18 @@ import Combine
 import IOKit
 
 class CPUManager: ObservableObject {
-    @Published var usage = CPUUsage()
-    @Published var frequency = CPUFrequency()
-    @Published var loadAverage = LoadAverage()
-    @Published var uptime: TimeInterval = 0
-    @Published var topProcesses: [TopProcess] = []
-    @Published var usageHistory: [CPUUsageSnapshot] = []
+    var usage = CPUUsage()
+    var frequency = CPUFrequency()
+    var loadAverage = LoadAverage()
+    var uptime: TimeInterval = 0
+    var topProcesses: [TopProcess] = []
+    var usageHistory: [CPUUsageSnapshot] = []
 
-    private var timer: Timer?
-    private var processTimer: Timer?
-    private let readQueue = DispatchQueue(label: "com.boreas.cpu-read", qos: .utility)
-    private let processQueue = DispatchQueue(label: "com.boreas.cpu-process", qos: .background)
-    private let maxHistoryPoints = 86400
+    private let maxHistoryPoints = 1800
+
+    // Pre-allocated buffers — reused every poll to avoid heap churn
+    private var pidBuffer = [Int32](repeating: 0, count: 2048)
+    private var nameBuffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
 
     // Previous CPU ticks for delta calculation
     private var previousCoreTicks: [(user: UInt64, system: UInt64, idle: UInt64, nice: UInt64)] = []
@@ -30,20 +30,28 @@ class CPUManager: ObservableObject {
     private(set) var maxEFreqMHz: Int = 0
 
     struct CPUUsageSnapshot: Identifiable {
-        let id = UUID()
+        private static var counter: Int = 0
+        let id: Int
         let timestamp: Date
         let total: Double
         let user: Double
         let system: Double
+
+        init(timestamp: Date, total: Double, user: Double, system: Double) {
+            CPUUsageSnapshot.counter += 1
+            self.id = CPUUsageSnapshot.counter
+            self.timestamp = timestamp
+            self.total = total
+            self.user = user
+            self.system = system
+        }
     }
 
     init() {
         detectTopology()
-        startMonitoring()
     }
 
     deinit {
-        stopMonitoring()
     }
 
     // MARK: - Core Topology
@@ -119,62 +127,35 @@ class CPUManager: ObservableObject {
         }
     }
 
-    // MARK: - Monitoring
+    // MARK: - Compute / Apply (coordinator calls compute on background, apply on main)
 
-    func startMonitoring() {
-        // Fast polling for CPU usage (1s)
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.update()
-        }
-        RunLoop.main.add(timer!, forMode: .common)
-
-        // Slower polling for top processes (3s)
-        processTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
-            self?.updateTopProcesses()
-        }
-        RunLoop.main.add(processTimer!, forMode: .common)
-
-        // Initial read
-        update()
-        updateTopProcesses()
+    struct FastResult {
+        let usage: CPUUsage
+        let load: LoadAverage
+        let uptime: TimeInterval
+        let freq: CPUFrequency
+        let snapshot: CPUUsageSnapshot
     }
 
-    func stopMonitoring() {
-        timer?.invalidate()
-        timer = nil
-        processTimer?.invalidate()
-        processTimer = nil
+    func computeUsage() -> FastResult {
+        let usage = readPerCoreUsage()
+        let load = readLoadAverage()
+        let up = readUptime()
+        let freq = readFrequency(pUsage: usage.performanceCores, eUsage: usage.efficiencyCores)
+        let snapshot = CPUUsageSnapshot(timestamp: Date(), total: usage.total, user: usage.user, system: usage.system)
+        return FastResult(usage: usage, load: load, uptime: up, freq: freq, snapshot: snapshot)
     }
 
-    // MARK: - CPU Usage via host_processor_info
-
-    private func update() {
-        readQueue.async { [weak self] in
-            guard let self = self else { return }
-
-            let usage = self.readPerCoreUsage()
-            let load = self.readLoadAverage()
-            let up = self.readUptime()
-            let freq = self.readFrequency(pUsage: usage.performanceCores, eUsage: usage.efficiencyCores)
-
-            let snapshot = CPUUsageSnapshot(
-                timestamp: Date(),
-                total: usage.total,
-                user: usage.user,
-                system: usage.system
-            )
-
-            DispatchQueue.main.async {
-                self.usage = usage
-                self.loadAverage = load
-                self.uptime = up
-                self.frequency = freq
-                self.usageHistory.append(snapshot)
-                if self.usageHistory.count > self.maxHistoryPoints {
-                    self.usageHistory.removeFirst(self.usageHistory.count - self.maxHistoryPoints)
-                }
-            }
+    func applyUsage(_ r: FastResult) {
+        usage = r.usage
+        loadAverage = r.load
+        uptime = r.uptime
+        frequency = r.freq
+        usageHistory.append(r.snapshot)
+        if usageHistory.count > maxHistoryPoints {
+            usageHistory.removeSubrange(0..<(usageHistory.count - maxHistoryPoints))
         }
+        objectWillChange.send()
     }
 
     private func readPerCoreUsage() -> CPUUsage {
@@ -340,38 +321,34 @@ class CPUManager: ObservableObject {
         return freq
     }
 
-    // MARK: - Top Processes
+    func computeProcesses() -> [TopProcess] {
+        readTopProcesses(limit: 8)
+    }
 
-    private func updateTopProcesses() {
-        processQueue.async { [weak self] in
-            guard let self = self else { return }
-            let procs = self.readTopProcesses(limit: 8)
-            DispatchQueue.main.async {
-                self.topProcesses = procs
-            }
-        }
+    func applyProcesses(_ procs: [TopProcess]) {
+        topProcesses = procs
+        objectWillChange.send()
     }
 
     private func readTopProcesses(limit: Int) -> [TopProcess] {
-        var bufferSize: Int32 = 0
-        var pids = [Int32](repeating: 0, count: 2048)
-        bufferSize = proc_listpids(UInt32(PROC_ALL_PIDS), 0, &pids, Int32(MemoryLayout<Int32>.stride * pids.count))
+        let bufferSize = proc_listpids(UInt32(PROC_ALL_PIDS), 0, &pidBuffer, Int32(MemoryLayout<Int32>.stride * pidBuffer.count))
 
         guard bufferSize > 0 else { return [] }
         let count = Int(bufferSize) / MemoryLayout<Int32>.stride
 
         var processes: [TopProcess] = []
+        processes.reserveCapacity(min(count, 64))
 
         for i in 0..<count {
-            let pid = pids[i]
+            let pid = pidBuffer[i]
             guard pid > 0 else { continue }
 
             var taskInfo = proc_taskinfo()
             let size = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &taskInfo, Int32(MemoryLayout<proc_taskinfo>.size))
             guard size == MemoryLayout<proc_taskinfo>.size else { continue }
 
-            // Get process name
-            var nameBuffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+            // Get process name using pre-allocated buffer
+            nameBuffer[0] = 0
             proc_name(pid, &nameBuffer, UInt32(nameBuffer.count))
             let name = String(cString: nameBuffer)
             guard !name.isEmpty else { continue }

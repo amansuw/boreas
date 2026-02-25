@@ -49,13 +49,13 @@ enum FanControlMode: String, CaseIterable, Identifiable {
 class FanManager: ObservableObject {
     static weak var shared: FanManager?
 
-    @Published var fans: [FanInfo] = []
+    var fans: [FanInfo] = []
     @Published var controlMode: FanControlMode = .automatic
     @Published var manualSpeedPercentage: Double = 50.0
     @Published var isControlActive = false
     @Published var hasWriteAccess = false
     @Published var isRequestingAccess = false
-    @Published var isYielding = false  // true while waiting for thermalmonitord to yield after Ftst=1
+    @Published var isYielding = false
     @Published private(set) var isCurveCooldownActive = false
 
     /// Average current speed as percentage of range (min→max) across all fans
@@ -85,7 +85,6 @@ class FanManager: ObservableObject {
     private var lastCurveAboveZero: Date = .distantPast
     private let curveModeTransitionCooldown: TimeInterval = 30
 
-    private var timer: Timer?
     private let smc = SMCKit.shared
 
     private func setCurveCooldown(_ value: Bool) {
@@ -103,11 +102,9 @@ class FanManager: ObservableObject {
         FanManager.shared = self
         discoverFans()
         hasWriteAccess = smc.testWriteAccess()
-        startMonitoring()
     }
 
     deinit {
-        stopMonitoring()
         shutdownHelper()
     }
 
@@ -528,15 +525,53 @@ class FanManager: ObservableObject {
         }
     }
 
-    func startMonitoring() {
-        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.updateFanReadings()
-            self?.reevaluateCurveIfNeeded()
+    // MARK: - Compute / Apply
+    // Fan readings use helperQueue for privileged reads, so helper path
+    // dispatches to main on its own. Non-helper path returns results for batching.
+
+    /// Pending fan speeds set by helperQueue (applied in next coordinator main.async)
+    private var pendingFanSpeeds: [(Int, Double)]?
+
+    func computeReadings() {
+        let fansCopy = fans
+        guard !fansCopy.isEmpty else { return }
+
+        if helperRunning {
+            helperQueue.async { [weak self] in
+                guard let self = self else { return }
+                var speeds = [(Int, Double)]()
+                for i in 0..<fansCopy.count {
+                    let key = "F\(fansCopy[i].index)Ac"
+                    if let speed = self.privilegedReadDouble(key: key) {
+                        speeds.append((i, speed))
+                    }
+                }
+                self.pendingFanSpeeds = speeds
+            }
+        } else {
+            var speeds = [(Int, Double)]()
+            for i in 0..<fansCopy.count {
+                if let current = smc.getFanCurrentSpeed(fanIndex: fansCopy[i].index) {
+                    speeds.append((i, current))
+                }
+            }
+            pendingFanSpeeds = speeds
         }
-        RunLoop.main.add(timer!, forMode: .common)
+
+        reevaluateCurveIfNeeded()
     }
 
-    /// Periodically re-evaluate the active fan curve based on current temperature
+    func applyReadings() {
+        guard let speeds = pendingFanSpeeds else { return }
+        pendingFanSpeeds = nil
+        for (i, speed) in speeds {
+            if i < fans.count {
+                fans[i].currentSpeed = speed
+            }
+        }
+        objectWillChange.send()
+    }
+
     private func reevaluateCurveIfNeeded() {
         guard controlMode == .curve,
               let curve = activeCurve,
@@ -544,44 +579,6 @@ class FanManager: ObservableObject {
         let temp = tempProvider()
         guard temp > 0 else { return }
         applyFanCurveSpeed(temperature: temp, curve: curve)
-    }
-
-    func stopMonitoring() {
-        timer?.invalidate()
-        timer = nil
-    }
-
-    func updateFanReadings() {
-        let fansCopy = fans
-        guard !fansCopy.isEmpty else { return }
-
-        if helperRunning {
-            // Read through daemon (root connection) — critical for Apple Silicon
-            helperQueue.async { [weak self] in
-                guard let self = self else { return }
-                for i in 0..<fansCopy.count {
-                    let key = "F\(fansCopy[i].index)Ac"
-                    if let speed = self.privilegedReadDouble(key: key) {
-                        DispatchQueue.main.async {
-                            if i < self.fans.count {
-                                self.fans[i].currentSpeed = speed
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            // Fallback: direct non-root read
-            for i in 0..<fansCopy.count {
-                if let current = smc.getFanCurrentSpeed(fanIndex: fansCopy[i].index) {
-                    DispatchQueue.main.async {
-                        if i < self.fans.count {
-                            self.fans[i].currentSpeed = current
-                        }
-                    }
-                }
-            }
-        }
     }
 
     // MARK: - Fan Control

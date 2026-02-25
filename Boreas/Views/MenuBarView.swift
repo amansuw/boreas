@@ -30,7 +30,7 @@ struct MenuBarTemperatureChart: View {
     let yDomain: ClosedRange<Double>
 
     private struct ChartSample: Identifiable {
-        let id = UUID()
+        let id: Int
         let timestamp: Date
         let avgCPU: Double
         let maxCPU: Double
@@ -38,6 +38,7 @@ struct MenuBarTemperatureChart: View {
         let maxGPU: Double
 
         init(snapshot: TemperatureSnapshot) {
+            self.id = snapshot.id
             self.timestamp = snapshot.timestamp
             self.avgCPU = snapshot.avgCPU
             self.maxCPU = snapshot.maxCPU
@@ -45,7 +46,8 @@ struct MenuBarTemperatureChart: View {
             self.maxGPU = snapshot.maxGPU
         }
 
-        init(timestamp: Date, avgCPU: Double, maxCPU: Double, avgGPU: Double, maxGPU: Double) {
+        init(id: Int = 0, timestamp: Date, avgCPU: Double, maxCPU: Double, avgGPU: Double, maxGPU: Double) {
+            self.id = id
             self.timestamp = timestamp
             self.avgCPU = avgCPU
             self.maxCPU = maxCPU
@@ -54,7 +56,7 @@ struct MenuBarTemperatureChart: View {
         }
 
         func withTimestamp(_ timestamp: Date) -> ChartSample {
-            ChartSample(timestamp: timestamp, avgCPU: avgCPU, maxCPU: maxCPU, avgGPU: avgGPU, maxGPU: maxGPU)
+            ChartSample(id: id, timestamp: timestamp, avgCPU: avgCPU, maxCPU: maxCPU, avgGPU: avgGPU, maxGPU: maxGPU)
         }
     }
 

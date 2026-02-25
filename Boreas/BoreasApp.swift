@@ -31,39 +31,14 @@ struct BoreasApp: App {
 struct StatusBarIconView: View {
     @ObservedObject var fanManager: FanManager
 
-    // private var iconSpeed: Speed {
-    //     // White: curve cooldown (takes absolute priority)
-    //     if fanManager.isCurveCooldownActive { return .1 }
-    //     // Also show white while yielding control/unlocking
-    //     if fanManager.isYielding { return .1 }
-
-    //     let pct = max(0, fanManager.averageSpeedPercentage)
-    //     switch pct {
-    //     case 0:
-    //         return .gray    // idle
-    //     case ..<20:
-    //         return .blue
-    //     case ..<40:
-    //         return .green
-    //     case ..<60:
-    //         return .yellow
-    //     case ..<80:
-    //         return .orange
-    //     default:
-    //         return .red
-    //     }
-    // }
-
     private var iconColor: Color {
-        // White: curve cooldown (takes absolute priority)
         if fanManager.isCurveCooldownActive { return .white }
-        // Also show white while yielding control/unlocking
         if fanManager.isYielding { return .white }
 
         let pct = max(0, fanManager.averageSpeedPercentage)
         switch pct {
         case 0:
-            return .gray    // idle
+            return .gray
         case ..<20:
             return .blue
         case ..<40:
@@ -77,31 +52,22 @@ struct StatusBarIconView: View {
         }
     }
 
-    private var isSpinning: Bool { fanManager.shouldSpinIcon }
-    @State private var rotation: Double = 0
+    /// Rotation maps directly to fan speed percentage.
+    /// Only animates briefly when speed changes (every poll tick), then stops.
+    /// This replaces the old .repeatForever animation that ran at ~60fps continuously.
+    private var iconRotation: Double {
+        max(0, fanManager.averageSpeedPercentage) * 3.6
+    }
 
     var body: some View {
         HStack(spacing: 3) {
             Image(systemName: "fan.fill")
                 .font(.system(size: 16, weight: .medium))
                 .foregroundColor(iconColor)
-                .rotationEffect(.degrees(rotation))
-                .animation(isSpinning
-                           ? .linear(duration: 2).repeatForever(autoreverses: false)
-                           : .default,
-                           value: rotation)
+                .rotationEffect(.degrees(iconRotation))
+                .animation(.easeInOut(duration: 0.4), value: iconRotation)
         }
         .frame(height: 30)
-        .onAppear {
-            if isSpinning { rotation = 180 }
-        }
-        .onChange(of: isSpinning) { _, spinning in
-            if spinning {
-                rotation = 180
-            } else {
-                rotation = 0
-            }
-        }
     }
 }
 
@@ -350,6 +316,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let networkManager = NetworkManager()
     let diskManager = DiskManager()
 
+    private let coordinator = MonitorCoordinator()
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private var hostingView: NSHostingView<StatusBarIconView>?
@@ -358,6 +325,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
+        startCoordinator()
+    }
+
+    private func startCoordinator() {
+        coordinator.cpu = cpuManager
+        coordinator.ram = ramManager
+        coordinator.gpu = gpuManager
+        coordinator.sensor = sensorManager
+        coordinator.fan = fanManager
+        coordinator.network = networkManager
+        coordinator.disk = diskManager
+        coordinator.battery = batteryManager
+        coordinator.start()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -365,6 +345,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        coordinator.stop()
         FanManager.shared?.shutdownHelper()
         SMCKit.shared.resetAllFansToAutomatic()
     }
